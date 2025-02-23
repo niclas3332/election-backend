@@ -195,7 +195,7 @@ function processPartyResult(row) {
 // Modify fetchElectionData to save CSV
 async function fetchElectionData() {
     try {
-        const response = await axios.get('https://www.bundeswahlleiterin.de/bundestagswahlen/2021/ergebnisse/opendata/btw21/20240211_wdhwahl-vgl2017/csv/kerg2.csv', {
+        const response = await axios.get('https://www.bundeswahlleiterin.de/bundestagswahlen/2025/ergebnisse/opendata/btw25/csv/kerg2.csv', {
             responseType: 'arraybuffer'
         });
 
