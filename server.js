@@ -9,6 +9,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
+import moment from "moment"
 dotenv.config();
 
 // Configure PostgreSQL numeric type parser
@@ -167,9 +168,10 @@ function extractMetadata(lines) {
     const statusLine = lines[4].split(';');
     const timestampLine = lines[5].split(';');
 
+    console.log(`${timestampLine[1]} ${timestampLine[2]}`.trim())
     return {
         status: statusLine[1]?.trim() || '',
-        lastUpdated: new Date(`${timestampLine[1]} ${timestampLine[2]}`.trim())
+        lastUpdated: moment(`${timestampLine[1]} ${timestampLine[2]}`.trim(), "DD.MM.YY HH:mm:ss").toDate()
     };
 }
 
@@ -271,6 +273,7 @@ async function storeElectionData({ data, metadata }) {
     try {
         await client.query('BEGIN');
 
+        console.log(metadata)
         // Create new snapshot
         const snapshotResult = await client.query(
             'INSERT INTO snapshots (status, last_updated) VALUES ($1, $2) RETURNING id',
@@ -539,7 +542,55 @@ app.get('/api/federal/history', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
+app.get('/api/districts/history', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                s.id as snapshot_id,
+                s.timestamp,
+                s.status,
+                s.last_updated,
+                dr.district_number,
+                dr.district_name,
+                dr.state_number,
+                dr.eligible_voters,
+                dr.total_voters,
+                dr.turnout_percentage,
+                dr.invalid_primary,
+                dr.invalid_secondary,
+                dr.valid_primary,
+                dr.valid_secondary,
+                json_agg(json_build_object(
+                        'party_name', dpr.party_name,
+                        'percentage', dpr.percentage,
+                        'votes', dpr.votes
+                         ) ORDER BY dpr.percentage DESC) as parties
+            FROM snapshots s
+                     JOIN district_results dr ON dr.snapshot_id = s.id
+                     JOIN district_party_results dpr ON dpr.snapshot_id = s.id
+                     AND dpr.district_number = dr.district_number
+            GROUP BY
+                s.id,
+                s.timestamp,
+                s.status,
+                s.last_updated,
+                dr.district_number,
+                dr.district_name,
+                dr.state_number,
+                dr.eligible_voters,
+                dr.total_voters,
+                dr.turnout_percentage,
+                dr.invalid_primary,
+                dr.invalid_secondary,
+                dr.valid_primary,
+                dr.valid_secondary
+            ORDER BY s.timestamp DESC, dr.district_number
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 app.get('/api/districts/current', async (req, res) => {
     try {
         const result = await pool.query(`
