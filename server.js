@@ -8,25 +8,29 @@ import Papa from 'papaparse';
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
+import dotenv from 'dotenv';
+dotenv.config();
 
 // Configure PostgreSQL numeric type parser
 pg.types.setTypeParser(pg.types.builtins.NUMERIC, val => parseFloat(val));
 pg.types.setTypeParser(pg.types.builtins.INT8, val => parseInt(val));
-var corsOptions = {
-    origin: '*',
-    optionsSuccessStatus: 200 // some legacy browsers (IE11, various SmartTVs) choke on 204
+
+const corsOptions = {
+    origin: process.env.CORS_ORIGIN,
+    optionsSuccessStatus: 200
 }
+
 const app = express();
 app.use(cors(corsOptions));
 app.use(express.json());
 
 // PostgreSQL Connection Pool
 const pool = new pg.Pool({
-    user: 'election',
-    host: 'localhost',
-    database: 'election',
-    password: 'election',
-    port: 5432,
+    user: process.env.DB_USER,
+    host: process.env.DB_HOST,
+    database: process.env.DB_NAME,
+    password: process.env.DB_PASSWORD,
+    port: parseInt(process.env.DB_PORT),
 });
 
 async function calculateSHA256(content) {
@@ -53,10 +57,10 @@ async function fileWithHashExists(hash) {
     }
 }
 
-
 function formatTimestampForFilename(date) {
     return date.toISOString().replace(/[:.]/g, '-');
 }
+
 async function isNewData(lastUpdated) {
     const result = await pool.query(
         'SELECT last_updated FROM snapshots ORDER BY timestamp DESC LIMIT 1'
@@ -67,8 +71,6 @@ async function isNewData(lastUpdated) {
     const lastStoredUpdate = result.rows[0].last_updated;
     return lastUpdated.getTime() !== lastStoredUpdate.getTime();
 }
-
-
 
 // Helper function to parse German number format (e.g., "1.234,56" -> 1234.56)
 function parseGermanNumber(str) {
@@ -129,6 +131,30 @@ async function initDatabase() {
                                                                party_name TEXT,
                                                                percentage NUMERIC(5,2),
                                                                votes BIGINT
+            );
+
+            CREATE TABLE IF NOT EXISTS district_results (
+                                                            id SERIAL PRIMARY KEY,
+                                                            snapshot_id INTEGER REFERENCES snapshots(id),
+                                                            district_number TEXT,
+                                                            district_name TEXT,
+                                                            state_number TEXT,
+                                                            eligible_voters BIGINT,
+                                                            total_voters BIGINT,
+                                                            turnout_percentage NUMERIC(5,2),
+                                                            invalid_primary BIGINT,
+                                                            invalid_secondary BIGINT,
+                                                            valid_primary BIGINT,
+                                                            valid_secondary BIGINT
+            );
+
+            CREATE TABLE IF NOT EXISTS district_party_results (
+                                                                  id SERIAL PRIMARY KEY,
+                                                                  snapshot_id INTEGER REFERENCES snapshots(id),
+                                                                  district_number TEXT,
+                                                                  party_name TEXT,
+                                                                  percentage NUMERIC(5,2),
+                                                                  votes BIGINT
             );
         `);
     } finally {
@@ -191,11 +217,10 @@ function processPartyResult(row) {
     };
 }
 
-
 // Modify fetchElectionData to save CSV
 async function fetchElectionData() {
     try {
-        const response = await axios.get('https://www.bundeswahlleiterin.de/bundestagswahlen/2025/ergebnisse/opendata/btw25/csv/kerg2.csv', {
+        const response = await axios.get(process.env.ELECTION_CSV_URL, {
             responseType: 'arraybuffer'
         });
 
@@ -240,9 +265,6 @@ async function fetchElectionData() {
     }
 }
 
-
-
-
 // Store election data in database
 async function storeElectionData({ data, metadata }) {
     const client = await pool.connect();
@@ -257,11 +279,15 @@ async function storeElectionData({ data, metadata }) {
         const snapshotId = snapshotResult.rows[0].id;
 
         // Process federal results
-        const federalResults = { eligible_voters: 0, total_voters: 0, turnout_percentage: 0,
-            invalid_primary: 0, invalid_secondary: 0, valid_primary: 0, valid_secondary: 0 };
+        const federalResults = {
+            eligible_voters: 0, total_voters: 0, turnout_percentage: 0,
+            invalid_primary: 0, invalid_secondary: 0, valid_primary: 0, valid_secondary: 0
+        };
         const federalPartyResults = [];
         const stateResults = new Map();
         const statePartyResults = new Map();
+        const districtResults = new Map();
+        const districtPartyResults = new Map();
 
         for (const row of data) {
             if (row.Gebietsart === 'Bund') {
@@ -273,6 +299,34 @@ async function storeElectionData({ data, metadata }) {
                 } else if (row.Gruppenart === 'Partei') {
                     const partyResult = processPartyResult(row);
                     if (partyResult) federalPartyResults.push(partyResult);
+                }
+            } else if (row.Gebietsart === 'Wahlkreis') {
+                const districtNumber = row.Gebietsnummer;
+                const stateNumber = row.UegGebietsnummer;
+
+                if (!districtResults.has(districtNumber)) {
+                    districtResults.set(districtNumber, {
+                        district_number: districtNumber,
+                        district_name: row.Gebietsname,
+                        state_number: stateNumber,
+                        eligible_voters: 0, total_voters: 0, turnout_percentage: 0,
+                        invalid_primary: 0, invalid_secondary: 0, valid_primary: 0, valid_secondary: 0
+                    });
+                }
+
+                if (row.Gruppenart === 'System-Gruppe') {
+                    const systemData = processSystemGroup(row);
+                    Object.entries(systemData).forEach(([key, value]) => {
+                        if (value !== null) districtResults.get(districtNumber)[key.toLowerCase()] = value;
+                    });
+                } else if (row.Gruppenart === 'Partei') {
+                    const partyResult = processPartyResult(row);
+                    if (partyResult) {
+                        if (!districtPartyResults.has(districtNumber)) {
+                            districtPartyResults.set(districtNumber, []);
+                        }
+                        districtPartyResults.get(districtNumber).push(partyResult);
+                    }
                 }
             } else if (row.Gebietsart === 'Land') {
                 const stateNumber = row.Gebietsnummer;
@@ -335,12 +389,37 @@ async function storeElectionData({ data, metadata }) {
             );
         }
 
-        // Store state party results
+// Store state party results
         for (const [stateNumber, parties] of statePartyResults) {
             for (const party of parties) {
                 await client.query(
                     'INSERT INTO state_party_results (snapshot_id, state_number, party_name, percentage, votes) VALUES ($1, $2, $3, $4, $5)',
                     [snapshotId, stateNumber, party.partyName, party.percentage, party.votes]
+                );
+            }
+        }
+
+        // Store district results
+        for (const district of districtResults.values()) {
+            await client.query(
+                `INSERT INTO district_results
+                 (snapshot_id, district_number, district_name, state_number, eligible_voters,
+                  total_voters, turnout_percentage, invalid_primary, invalid_secondary,
+                  valid_primary, valid_secondary)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+                [snapshotId, district.district_number, district.district_name, district.state_number,
+                    district.eligible_voters, district.total_voters, district.turnout_percentage,
+                    district.invalid_primary, district.invalid_secondary, district.valid_primary,
+                    district.valid_secondary]
+            );
+        }
+
+        // Store district party results
+        for (const [districtNumber, parties] of districtPartyResults) {
+            for (const party of parties) {
+                await client.query(
+                    'INSERT INTO district_party_results (snapshot_id, district_number, party_name, percentage, votes) VALUES ($1, $2, $3, $4, $5)',
+                    [snapshotId, districtNumber, party.partyName, party.percentage, party.votes]
                 );
             }
         }
@@ -354,6 +433,7 @@ async function storeElectionData({ data, metadata }) {
         client.release();
     }
 }
+
 app.get('/api/latest-csv', async (req, res) => {
     try {
         const csvDir = path.join(process.cwd(), 'election_data');
@@ -387,6 +467,7 @@ app.get('/api/latest-csv', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
 // API Routes
 app.get('/api/federal/current', async (req, res) => {
     try {
@@ -432,14 +513,14 @@ app.get('/api/federal/history', async (req, res) => {
                 fr.valid_primary,
                 fr.valid_secondary,
                 json_agg(json_build_object(
-                    'party_name', fpr.party_name,
-                    'percentage', fpr.percentage,
-                    'votes', fpr.votes
-                ) ORDER BY fpr.percentage DESC) as parties
+                        'party_name', fpr.party_name,
+                        'percentage', fpr.percentage,
+                        'votes', fpr.votes
+                         ) ORDER BY fpr.percentage DESC) as parties
             FROM snapshots s
-            JOIN federal_results fr ON fr.snapshot_id = s.id
-            JOIN federal_party_results fpr ON fpr.snapshot_id = s.id
-            GROUP BY 
+                     JOIN federal_results fr ON fr.snapshot_id = s.id
+                     JOIN federal_party_results fpr ON fpr.snapshot_id = s.id
+            GROUP BY
                 s.id,
                 s.timestamp,
                 s.status,
@@ -459,6 +540,40 @@ app.get('/api/federal/history', async (req, res) => {
     }
 });
 
+app.get('/api/districts/current', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            WITH latest_snapshot AS (
+                SELECT id FROM snapshots ORDER BY timestamp DESC LIMIT 1
+            )
+            SELECT
+                dr.district_number,
+                dr.district_name,
+                dr.state_number,
+                dr.eligible_voters,
+                dr.total_voters,
+                dr.turnout_percentage,
+                dr.invalid_primary,
+                dr.invalid_secondary,
+                dr.valid_primary,
+                dr.valid_secondary,
+                json_agg(json_build_object(
+                        'party_name', dpr.party_name,
+                        'percentage', dpr.percentage,
+                        'votes', dpr.votes
+                         ) ORDER BY dpr.percentage DESC) as parties
+            FROM latest_snapshot ls
+                     JOIN district_results dr ON dr.snapshot_id = ls.id
+                     JOIN district_party_results dpr ON dpr.snapshot_id = ls.id
+                AND dpr.district_number = dr.district_number
+            GROUP BY dr.id
+            ORDER BY dr.district_number
+        `);
+        res.json(result.rows);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
 app.get('/api/states/current', async (req, res) => {
     try {
@@ -510,7 +625,6 @@ app.get('/api/fetch-now', async (req, res) => {
     }
 });
 
-
 // Schedule data collection
 cron.schedule('* * * * *', async () => {
     try {
@@ -543,4 +657,4 @@ initDatabase()
     .catch(error => {
         console.error('Failed to initialize database:', error);
         process.exit(1);
-    });
+    })
