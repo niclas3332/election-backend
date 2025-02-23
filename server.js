@@ -535,7 +535,7 @@ cron.schedule('* * * * *', async () => {
 // Start server
 initDatabase()
     .then(() => {
-        const PORT = process.env.PORT || 3000;
+        const PORT = process.env.PORT || 3010;
         app.listen(PORT, () => {
             console.log(`Server running on port ${PORT}`);
         });
