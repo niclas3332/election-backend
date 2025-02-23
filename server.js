@@ -22,10 +22,10 @@ app.use(express.json());
 
 // PostgreSQL Connection Pool
 const pool = new pg.Pool({
-    user: 'postgres',
+    user: 'election',
     host: 'localhost',
-    database: 'election_tracker',
-    password: '',
+    database: 'election',
+    password: 'election',
     port: 5432,
 });
 
