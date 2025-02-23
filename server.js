@@ -5,13 +5,19 @@ import cors from 'cors';
 import cron from 'node-cron';
 import axios from 'axios';
 import Papa from 'papaparse';
+import fs from 'fs/promises';
+import path from 'path';
+import crypto from 'crypto';
 
 // Configure PostgreSQL numeric type parser
 pg.types.setTypeParser(pg.types.builtins.NUMERIC, val => parseFloat(val));
 pg.types.setTypeParser(pg.types.builtins.INT8, val => parseInt(val));
-
+var corsOptions = {
+    origin: '*',
+    optionsSuccessStatus: 200 // some legacy browsers (IE11, various SmartTVs) choke on 204
+}
 const app = express();
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // PostgreSQL Connection Pool
@@ -22,6 +28,47 @@ const pool = new pg.Pool({
     password: '',
     port: 5432,
 });
+
+async function calculateSHA256(content) {
+    const hash = crypto.createHash('sha256');
+    hash.update(content);
+    return hash.digest('hex');
+}
+
+async function fileWithHashExists(hash) {
+    try {
+        const csvDir = path.join(process.cwd(), 'election_data');
+        const files = await fs.readdir(csvDir);
+        for (const file of files) {
+            if (file.includes(hash)) {
+                return true;
+            }
+        }
+        return false;
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return false;
+        }
+        throw error;
+    }
+}
+
+
+function formatTimestampForFilename(date) {
+    return date.toISOString().replace(/[:.]/g, '-');
+}
+async function isNewData(lastUpdated) {
+    const result = await pool.query(
+        'SELECT last_updated FROM snapshots ORDER BY timestamp DESC LIMIT 1'
+    );
+
+    if (result.rows.length === 0) return true;
+
+    const lastStoredUpdate = result.rows[0].last_updated;
+    return lastUpdated.getTime() !== lastStoredUpdate.getTime();
+}
+
+
 
 // Helper function to parse German number format (e.g., "1.234,56" -> 1234.56)
 function parseGermanNumber(str) {
@@ -144,7 +191,8 @@ function processPartyResult(row) {
     };
 }
 
-// Fetch and process election data
+
+// Modify fetchElectionData to save CSV
 async function fetchElectionData() {
     try {
         const response = await axios.get('https://www.bundeswahlleiterin.de/bundestagswahlen/2021/ergebnisse/opendata/btw21/20240211_wdhwahl-vgl2017/csv/kerg2.csv', {
@@ -154,6 +202,23 @@ async function fetchElectionData() {
         const text = new TextDecoder('utf-8').decode(response.data);
         const lines = text.split('\n');
         const metadata = extractMetadata(lines);
+
+        // Calculate hash and save CSV to filesystem if new
+        const fileHash = await calculateSHA256(text);
+        const hashExists = await fileWithHashExists(fileHash);
+
+        if (!hashExists) {
+            const timestamp = formatTimestampForFilename(new Date());
+            const csvDir = path.join(process.cwd(), 'election_data');
+            await fs.mkdir(csvDir, { recursive: true });
+            await fs.writeFile(
+                path.join(csvDir, `election_data_${timestamp}_${fileHash}.csv`),
+                text
+            );
+            console.log(`Saved new CSV with hash: ${fileHash}`);
+        } else {
+            console.log(`CSV with hash ${fileHash} already exists, skipping save`);
+        }
 
         return new Promise((resolve, reject) => {
             Papa.parse(text, {
@@ -165,7 +230,7 @@ async function fetchElectionData() {
                     const lines = chunk.split('\n');
                     return lines[9] + '\n' + lines.slice(10).join('\n');
                 },
-                complete: results => resolve({ data: results.data, metadata }),
+                complete: results => resolve({ data: results.data, metadata, csvText: text }),
                 error: error => reject(error)
             });
         });
@@ -174,6 +239,9 @@ async function fetchElectionData() {
         throw error;
     }
 }
+
+
+
 
 // Store election data in database
 async function storeElectionData({ data, metadata }) {
@@ -286,7 +354,39 @@ async function storeElectionData({ data, metadata }) {
         client.release();
     }
 }
+app.get('/api/latest-csv', async (req, res) => {
+    try {
+        const csvDir = path.join(process.cwd(), 'election_data');
+        const files = await fs.readdir(csvDir);
 
+        // Filter for CSV files and sort by timestamp in filename
+        const csvFiles = files
+            .filter(file => file.endsWith('.csv'))
+            .sort((a, b) => {
+                // Extract timestamps from filenames (between 'data_' and '_hash')
+                const getTimestamp = filename => {
+                    const match = filename.match(/data_(.+?)_[a-f0-9]{64}/);
+                    return match ? match[1] : '';
+                };
+                return getTimestamp(b).localeCompare(getTimestamp(a));
+            });
+
+        if (csvFiles.length === 0) {
+            return res.status(404).json({ error: 'No CSV files found' });
+        }
+
+        const latestFile = csvFiles[0];
+        const filePath = path.join(csvDir, latestFile);
+        const fileContent = await fs.readFile(filePath, 'utf-8');
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', `attachment; filename="latest_election_data.csv"`);
+        res.send(fileContent);
+    } catch (error) {
+        console.error('Error serving CSV:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 // API Routes
 app.get('/api/federal/current', async (req, res) => {
     try {
@@ -396,21 +496,37 @@ app.get('/api/states/current', async (req, res) => {
 
 app.get('/api/fetch-now', async (req, res) => {
     try {
-        const data = await fetchElectionData();
-        const snapshotId = await storeElectionData(data);
-        res.json({ success: true, snapshotId });
+        const { data, metadata } = await fetchElectionData();
+        const isNew = await isNewData(metadata.lastUpdated);
+
+        if (isNew) {
+            const snapshotId = await storeElectionData({ data, metadata });
+            res.json({ success: true, snapshotId, dataUpdated: true });
+        } else {
+            res.json({ success: true, dataUpdated: false });
+        }
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
+
 // Schedule data collection
 cron.schedule('* * * * *', async () => {
     try {
         console.log('Starting scheduled data fetch:', new Date().toISOString());
-        const data = await fetchElectionData();
-        await storeElectionData(data);
-        console.log('Completed scheduled data fetch');
+        const { data, metadata } = await fetchElectionData();
+
+        // Check if we have new data
+        const isNew = await isNewData(metadata.lastUpdated);
+
+        if (isNew) {
+            console.log('New data detected, storing in database');
+            await storeElectionData({ data, metadata });
+            console.log('Completed storing new data');
+        } else {
+            console.log('No new data detected, skipping database update');
+        }
     } catch (error) {
         console.error('Error in scheduled task:', error);
     }
